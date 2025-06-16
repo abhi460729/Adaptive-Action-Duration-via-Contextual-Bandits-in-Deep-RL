@@ -1,0 +1,454 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import random
+from collections import deque, namedtuple
+import gym
+from typing import Tuple, List, Optional
+import matplotlib.pyplot as plt
+
+# Experience tuple for replay buffer
+Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done', 'duration'])
+
+class ContextualBandit(nn.Module):
+    """Contextual bandit for adaptive action duration selection."""
+    
+    def __init__(self, state_dim: int, num_durations: int, hidden_dim: int = 128):
+        super(ContextualBandit, self).__init__()
+        self.state_dim = state_dim
+        self.num_durations = num_durations
+        
+        # Context encoder
+        self.context_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 64)
+        )
+        
+        # Duration policy network
+        self.duration_policy = nn.Sequential(
+            nn.Linear(64, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_durations)
+        )
+        
+        # Value network for each duration
+        self.value_network = nn.Sequential(
+            nn.Linear(64, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_durations)
+        )
+        
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning duration probabilities and values."""
+        context = self.context_encoder(state)
+        duration_logits = self.duration_policy(context)
+        duration_values = self.value_network(context)
+        
+        return duration_logits, duration_values
+    
+    def select_duration(self, state: torch.Tensor, epsilon: float = 0.1) -> int:
+        """Select action duration using epsilon-greedy with contextual bandits."""
+        with torch.no_grad():
+            duration_logits, duration_values = self.forward(state)
+            
+            if random.random() < epsilon:
+                # Exploration: sample from softmax distribution
+                duration_probs = F.softmax(duration_logits, dim=-1)
+                duration = torch.multinomial(duration_probs, 1).item()
+            else:
+                # Exploitation: select duration with highest value
+                duration = torch.argmax(duration_values, dim=-1).item()
+                
+        return duration
+
+class AdaptiveDQN(nn.Module):
+    """Enhanced DQN with adaptive action duration capabilities."""
+    
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 512):
+        super(AdaptiveDQN, self).__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        # Convolutional layers for Atari frames
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(4, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU()
+        )
+        
+        # Calculate conv output size (for 84x84 Atari frames)
+        conv_out_size = 64 * 7 * 7
+        
+        # Fully connected layers
+        self.fc_layers = nn.Sequential(
+            nn.Linear(conv_out_size, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the network."""
+        x = self.conv_layers(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc_layers(x)
+        return x
+
+class AdaptiveActionDurationAgent:
+    """Main agent implementing adaptive action duration via contextual bandits."""
+    
+    def __init__(self, 
+                 state_dim: int,
+                 action_dim: int,
+                 num_durations: int = 5,
+                 lr: float = 1e-4,
+                 gamma: float = 0.99,
+                 epsilon: float = 1.0,
+                 epsilon_decay: float = 0.995,
+                 epsilon_min: float = 0.1,
+                 buffer_size: int = 10000,
+                 batch_size: int = 32,
+                 target_update_freq: int = 1000):
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_dim = action_dim
+        self.num_durations = num_durations
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        self.batch_size = batch_size
+        self.target_update_freq = target_update_freq
+        
+        # Duration options (in frames)
+        self.duration_options = [1, 2, 4, 8, 16][:num_durations]
+        
+        # Networks
+        self.q_network = AdaptiveDQN(state_dim, action_dim).to(self.device)
+        self.target_network = AdaptiveDQN(state_dim, action_dim).to(self.device)
+        self.contextual_bandit = ContextualBandit(
+            state_dim=64 * 7 * 7,  # Conv output size
+            num_durations=num_durations
+        ).to(self.device)
+        
+        # Optimizers
+        self.q_optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.bandit_optimizer = optim.Adam(self.contextual_bandit.parameters(), lr=lr)
+        
+        # Experience replay buffer
+        self.replay_buffer = deque(maxlen=buffer_size)
+        
+        # Training metrics
+        self.training_steps = 0
+        self.losses = []
+        self.rewards = []
+        self.duration_usage = np.zeros(num_durations)
+        
+        # Update target network
+        self.update_target_network()
+        
+    def update_target_network(self):
+        """Update target network with current network weights."""
+        self.target_network.load_state_dict(self.q_network.state_dict())
+    
+    def preprocess_state(self, state: np.ndarray) -> torch.Tensor:
+        """Preprocess state for neural network input."""
+        if len(state.shape) == 3:
+            state = np.expand_dims(state, 0)
+        return torch.FloatTensor(state).to(self.device)
+    
+    def get_conv_features(self, state: torch.Tensor) -> torch.Tensor:
+        """Extract convolutional features for contextual bandit."""
+        with torch.no_grad():
+            conv_out = self.q_network.conv_layers(state)
+            return conv_out.view(conv_out.size(0), -1)
+    
+    def select_action_and_duration(self, state: np.ndarray) -> Tuple[int, int]:
+        """Select both action and duration using epsilon-greedy and contextual bandit."""
+        state_tensor = self.preprocess_state(state)
+        
+        # Select action using epsilon-greedy on Q-values
+        if random.random() < self.epsilon:
+            action = random.randrange(self.action_dim)
+        else:
+            with torch.no_grad():
+                q_values = self.q_network(state_tensor)
+                action = q_values.argmax().item()
+        
+        # Select duration using contextual bandit
+        conv_features = self.get_conv_features(state_tensor)
+        duration_idx = self.contextual_bandit.select_duration(conv_features, self.epsilon)
+        duration = self.duration_options[duration_idx]
+        
+        # Update duration usage statistics
+        self.duration_usage[duration_idx] += 1
+        
+        return action, duration
+    
+    def store_experience(self, state: np.ndarray, action: int, reward: float, 
+                        next_state: np.ndarray, done: bool, duration: int):
+        """Store experience in replay buffer."""
+        self.replay_buffer.append(Experience(state, action, reward, next_state, done, duration))
+    
+    def sample_batch(self) -> Tuple[torch.Tensor, ...]:
+        """Sample a batch of experiences from replay buffer."""
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        
+        states = torch.FloatTensor([e.state for e in batch]).to(self.device)
+        actions = torch.LongTensor([e.action for e in batch]).to(self.device)
+        rewards = torch.FloatTensor([e.reward for e in batch]).to(self.device)
+        next_states = torch.FloatTensor([e.next_state for e in batch]).to(self.device)
+        dones = torch.BoolTensor([e.done for e in batch]).to(self.device)
+        durations = torch.LongTensor([self.duration_options.index(e.duration) for e in batch]).to(self.device)
+        
+        return states, actions, rewards, next_states, dones, durations
+    
+    def train_step(self):
+        """Perform one training step."""
+        if len(self.replay_buffer) < self.batch_size:
+            return
+        
+        states, actions, rewards, next_states, dones, durations = self.sample_batch()
+        
+        # Compute current Q-values
+        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
+        
+        # Compute next Q-values using target network
+        with torch.no_grad():
+            next_q_values = self.target_network(next_states).max(1)[0]
+            target_q_values = rewards + (self.gamma ** durations.float()) * next_q_values * (~dones)
+        
+        # Compute DQN loss
+        dqn_loss = F.mse_loss(current_q_values.squeeze(), target_q_values)
+        
+        # Update DQN
+        self.q_optimizer.zero_grad()
+        dqn_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), 1.0)
+        self.q_optimizer.step()
+        
+        # Train contextual bandit
+        conv_features = self.get_conv_features(states)
+        duration_logits, duration_values = self.contextual_bandit(conv_features)
+        
+        # Compute bandit loss (policy gradient + value loss)
+        duration_probs = F.softmax(duration_logits, dim=-1)
+        selected_probs = duration_probs.gather(1, durations.unsqueeze(1))
+        
+        # Use TD error as reward signal for bandit
+        td_error = (target_q_values - current_q_values.squeeze()).detach()
+        policy_loss = -torch.log(selected_probs.squeeze()) * td_error
+        
+        # Value loss for duration estimation
+        duration_targets = rewards + self.gamma * duration_values.max(1)[0].detach()
+        value_loss = F.mse_loss(duration_values.gather(1, durations.unsqueeze(1)).squeeze(), duration_targets)
+        
+        bandit_loss = policy_loss.mean() + 0.5 * value_loss
+        
+        # Update contextual bandit
+        self.bandit_optimizer.zero_grad()
+        bandit_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.contextual_bandit.parameters(), 1.0)
+        self.bandit_optimizer.step()
+        
+        # Update metrics
+        self.losses.append(dqn_loss.item())
+        self.training_steps += 1
+        
+        # Update target network
+        if self.training_steps % self.target_update_freq == 0:
+            self.update_target_network()
+        
+        # Decay epsilon
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        
+        return dqn_loss.item(), bandit_loss.item()
+
+class AtariEnvironmentWrapper:
+    """Wrapper for Atari environments with frame preprocessing."""
+    
+    def __init__(self, env_name: str = "Seaquest-v0"):
+        self.env = gym.make(env_name)
+        self.frame_stack = deque(maxlen=4)
+        
+    def reset(self):
+        """Reset environment and return initial state."""
+        obs = self.env.reset()
+        processed_obs = self.preprocess_frame(obs)
+        
+        # Fill frame stack with initial frame
+        for _ in range(4):
+            self.frame_stack.append(processed_obs)
+            
+        return np.array(self.frame_stack)
+    
+    def step(self, action: int, duration: int):
+        """Execute action for specified duration."""
+        total_reward = 0
+        done = False
+        
+        for _ in range(duration):
+            if done:
+                break
+                
+            obs, reward, done, info = self.env.step(action)
+            total_reward += reward
+            
+            processed_obs = self.preprocess_frame(obs)
+            self.frame_stack.append(processed_obs)
+        
+        return np.array(self.frame_stack), total_reward, done, info
+    
+    def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Preprocess frame: grayscale, resize, normalize."""
+        # Convert to grayscale
+        gray = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
+        
+        # Resize to 84x84 (simplified - normally would use cv2.resize)
+        resized = gray[::2, ::2] if gray.shape[0] > 84 else gray
+        
+        # Normalize
+        normalized = resized / 255.0
+        
+        return normalized
+    
+    def close(self):
+        """Close environment."""
+        self.env.close()
+
+def train_adaptive_agent(episodes: int = 1000, max_steps: int = 1000):
+    """Train the adaptive action duration agent."""
+    
+    # Initialize environment and agent
+    env = AtariEnvironmentWrapper("Seaquest-v0")
+    agent = AdaptiveActionDurationAgent(
+        state_dim=4,  # 4 stacked frames
+        action_dim=env.env.action_space.n,
+        num_durations=5
+    )
+    
+    episode_rewards = []
+    episode_lengths = []
+    
+    for episode in range(episodes):
+        state = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        
+        for step in range(max_steps):
+            # Select action and duration
+            action, duration = agent.select_action_and_duration(state)
+            
+            # Execute action
+            next_state, reward, done, _ = env.step(action, duration)
+            
+            # Store experience
+            agent.store_experience(state, action, reward, next_state, done, duration)
+            
+            # Train agent
+            if len(agent.replay_buffer) >= agent.batch_size:
+                dqn_loss, bandit_loss = agent.train_step()
+            
+            state = next_state
+            episode_reward += reward
+            episode_length += duration
+            
+            if done:
+                break
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+        
+        # Logging
+        if episode % 100 == 0:
+            avg_reward = np.mean(episode_rewards[-100:])
+            avg_length = np.mean(episode_lengths[-100:])
+            print(f"Episode {episode}: Avg Reward = {avg_reward:.2f}, "
+                  f"Avg Length = {avg_length:.2f}, Epsilon = {agent.epsilon:.3f}")
+            
+            # Print duration usage statistics
+            duration_percentages = agent.duration_usage / agent.duration_usage.sum() * 100
+            print("Duration usage:", {f"{agent.duration_options[i]}": f"{duration_percentages[i]:.1f}%" 
+                                   for i in range(len(agent.duration_options))})
+    
+    env.close()
+    return agent, episode_rewards, episode_lengths
+
+def evaluate_agent(agent, episodes: int = 10):
+    """Evaluate trained agent performance."""
+    env = AtariEnvironmentWrapper("Seaquest-v0")
+    
+    # Set agent to evaluation mode (no exploration)
+    agent.epsilon = 0.0
+    
+    eval_rewards = []
+    
+    for episode in range(episodes):
+        state = env.reset()
+        episode_reward = 0
+        
+        for step in range(1000):
+            action, duration = agent.select_action_and_duration(state)
+            next_state, reward, done, _ = env.step(action, duration)
+            
+            state = next_state
+            episode_reward += reward
+            
+            if done:
+                break
+        
+        eval_rewards.append(episode_reward)
+        print(f"Evaluation Episode {episode + 1}: Reward = {episode_reward}")
+    
+    avg_reward = np.mean(eval_rewards)
+    print(f"\nAverage Evaluation Reward: {avg_reward:.2f}")
+    
+    env.close()
+    return eval_rewards
+
+# Example usage and training
+if __name__ == "__main__":
+    print("Training Adaptive Action Duration Agent...")
+    print("="*50)
+    
+    # Train the agent
+    agent, rewards, lengths = train_adaptive_agent(episodes=500)
+    
+    print("\nTraining completed!")
+    print("="*50)
+    
+    # Evaluate the trained agent
+    print("\nEvaluating trained agent...")
+    eval_rewards = evaluate_agent(agent, episodes=5)
+    
+    # Plot training progress
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(rewards)
+    plt.title('Training Rewards')
+    plt.xlabel('Episode')
+    plt.ylabel('Reward')
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(lengths)
+    plt.title('Episode Lengths')
+    plt.xlabel('Episode')
+    plt.ylabel('Steps')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"\nFinal Performance Summary:")
+    print(f"Training Episodes: {len(rewards)}")
+    print(f"Final Training Reward: {rewards[-1]:.2f}")
+    print(f"Average Evaluation Reward: {np.mean(eval_rewards):.2f}")
